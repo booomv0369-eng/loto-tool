@@ -1,800 +1,794 @@
-# -*- coding: utf-8 -*-
-"""
-ロト6・ロト7分析ツール（Streamlit） v4
-- 貼り付け自動取り込み（任意）
-- ボーナス数字の保存・生成・見やすい表示
-- 詳細分析（短期偏り・10番台トレンド・直近出現密度など）
-- 簡易バックテスト（過去データで候補生成を再現し、ヒット度を集計）
-
-注意：当せんや利益を保証するものではありません。娯楽の範囲でご利用ください。
-"""
+# app.py
+# ロト6・ロト7分析ツール（ボーナス対応 / 自動取り込み / バックテスト / 見た目改善）
+# -------------------------------------------------------------
 from __future__ import annotations
 
-import io
 import re
+import math
 import time
-import random
+import itertools
 from dataclasses import dataclass
-from typing import List, Optional, Tuple, Dict
+from typing import List, Dict, Optional, Tuple, Set
 
 import numpy as np
 import pandas as pd
 import streamlit as st
 
-# -----------------------------
-# ページ設定 & スタイル
-# -----------------------------
-st.set_page_config(page_title="ロト6・ロト7分析ツール", layout="wide")
+
+# =========================
+# ページ設定 + CSS
+# =========================
+st.set_page_config(
+    page_title="ロト6・ロト7分析ツール",
+    page_icon="🎯",
+    layout="wide",
+)
 
 CSS = """
 <style>
 /* 全体 */
-.block-container {padding-top: 1.2rem; padding-bottom: 2rem;}
-h1, h2, h3 {letter-spacing: 0.02em;}
+.block-container { padding-top: 1.1rem; padding-bottom: 2.0rem; max-width: 1150px; }
+h1, h2, h3 { letter-spacing: 0.02em; }
+small { color:#64748b; }
+
+/* ナビっぽい見出し */
+.topline{
+  display:flex; gap:10px; align-items:center; flex-wrap:wrap;
+  margin-bottom:10px;
+}
+.badge{
+  display:inline-block; padding:6px 10px; border-radius:999px;
+  background:#f0f7ff; border:1px solid #dbeafe; color:#0f172a;
+  font-weight:700; font-size:0.85rem;
+}
+.badge2{
+  display:inline-block; padding:6px 10px; border-radius:999px;
+  background:#f8fafc; border:1px solid #e2e8f0; color:#0f172a;
+  font-weight:700; font-size:0.85rem;
+}
+
 /* カード */
-.card {
-  background: #ffffff;
-  border: 1px solid #e6e8ee;
-  border-radius: 16px;
-  padding: 16px 18px;
-  box-shadow: 0 2px 10px rgba(0,0,0,0.03);
+.card{
+  background:#ffffff; border:1px solid #e6e8ee; border-radius:16px;
+  padding:16px 18px; box-shadow:0 2px 10px rgba(0,0,0,0.03);
+  margin: 10px 0 16px 0;
 }
-.mini {
-  color: #6b7280;
-  font-size: 0.92rem;
+.hr{ height:1px; background:#eef2f7; margin:14px 0; }
+
+/* 注意 */
+.notice{
+  border-left:6px solid #0ea5e9; background:#f0f9ff;
+  padding:12px 14px; border-radius:10px; color:#0f172a;
+  margin:10px 0 14px 0;
 }
-.badge {
-  display: inline-block;
-  padding: 2px 10px;
-  border-radius: 999px;
-  background: #0f172a;
-  color: #ffffff;
-  font-size: 0.80rem;
+.warn{
+  border-left:6px solid #f59e0b; background:#fffbeb;
+  padding:12px 14px; border-radius:10px; color:#0f172a;
+  margin:10px 0 14px 0;
 }
-.badge-bonus {
-  display: inline-block;
-  padding: 2px 8px;
-  border-radius: 999px;
-  background: #f59e0b;
-  color: #0f172a;
-  font-weight: 700;
-  font-size: 0.80rem;
+
+/* 数字チップ */
+.chips{ display:flex; flex-wrap:wrap; gap:8px; }
+.chip{
+  display:inline-flex; align-items:center; justify-content:center;
+  min-width:38px; height:32px; padding:0 10px;
+  border-radius:999px; border:1px solid #e2e8f0;
+  background:#f8fafc; color:#0f172a; font-weight:800;
 }
-.hr {height: 1px; background:#eef0f5; margin: 10px 0 14px 0;}
-/* 重要メッセージ */
-.notice {
-  border-left: 6px solid #0ea5e9;
-  background: #f0f9ff;
-  padding: 12px 14px;
-  border-radius: 10px;
-  color: #0f172a;
-}
-/* 小さめテキスト */
-.small {font-size: 0.9rem; color: #475569;}
+.chip.main{ background:#0f172a; color:#ffffff; border-color:#0f172a; }
+.chip.bonus{ background:#f59e0b; color:#111827; border-color:#f59e0b; }
+.chip.dim{ background:#ffffff; color:#64748b; }
+
+/* 表 */
+thead tr th { background:#f8fafc !important; }
 </style>
 """
 st.markdown(CSS, unsafe_allow_html=True)
 
-APP_TITLE = "ロト6・ロト7分析ツール"
-APP_SUB = "貼り付け → 自動取り込み（任意）→ 分析 → 候補生成（ボーナス対応）→ バックテスト"
 
-# -----------------------------
-# ゲーム定義
-# -----------------------------
+# =========================
+# ゲーム設定
+# =========================
 @dataclass(frozen=True)
 class GameSpec:
     name: str
-    pick: int
-    max_n: int
-    has_bonus: bool = True
+    n_main: int
+    n_bonus: int
+    max_num: int
 
-LOTO6 = GameSpec("ロト6", pick=6, max_n=43, has_bonus=True)
-LOTO7 = GameSpec("ロト7", pick=7, max_n=37, has_bonus=True)
 
-# -----------------------------
-# 解析・生成ユーティリティ
-# -----------------------------
-def _safe_int(x) -> Optional[int]:
-    try:
-        if pd.isna(x):
-            return None
-        s = str(x).strip()
-        if not s:
-            return None
-        return int(s)
-    except Exception:
+LOTO6 = GameSpec("ロト6", n_main=6, n_bonus=1, max_num=43)
+LOTO7 = GameSpec("ロト7", n_main=7, n_bonus=2, max_num=37)
+
+GAME_MAP = {"ロト6": LOTO6, "ロト7": LOTO7}
+
+
+# =========================
+# セッション初期化
+# =========================
+def init_state():
+    if "history" not in st.session_state:
+        st.session_state.history = {"ロト6": [], "ロト7": []}  # list of Draw
+    if "history_keyset" not in st.session_state:
+        st.session_state.history_keyset = {"ロト6": set(), "ロト7": set()}
+    if "paste_text" not in st.session_state:
+        st.session_state.paste_text = ""
+    if "last_processed_text" not in st.session_state:
+        st.session_state.last_processed_text = ""
+    if "public_url" not in st.session_state:
+        st.session_state.public_url = "https://xxxxxxxxxxxxxxxxxxxx.streamlit.app/"
+    if "generated" not in st.session_state:
+        st.session_state.generated = []
+
+
+init_state()
+
+
+# =========================
+# パース：貼り付け
+# =========================
+@dataclass
+class Draw:
+    round_no: Optional[int]
+    main: Tuple[int, ...]
+    bonus: Tuple[int, ...]
+
+
+def _normalize_numbers(tokens: List[str]) -> List[str]:
+    # 例: "3,4,12" -> "3" "4" "12"
+    out = []
+    for t in tokens:
+        t = t.strip()
+        if not t:
+            continue
+        for part in re.split(r"[,\s]+", t):
+            part = part.strip()
+            if part:
+                out.append(part)
+    return out
+
+
+def parse_draw_line(line: str, spec: GameSpec) -> Optional[Draw]:
+    """
+    受け付け例（ロト6）:
+    - 第2067回 3,4,12,15,32,33 B34
+    - 2067 3 4 12 15 32 33 34（最後をボーナス扱いにしたい場合は B を付けるの推奨）
+    受け付け例（ロト7）:
+    - 第600回 1,5,7,12,18,21,33 B2 35
+    - 600 1 5 7 12 18 21 33 B:2 35
+    """
+    raw = line.strip()
+    if not raw:
         return None
 
-def normalize_main(nums: List[int], spec: GameSpec) -> List[int]:
-    nums = [int(n) for n in nums if n is not None]
-    nums = [n for n in nums if 1 <= n <= spec.max_n]
-    nums = sorted(nums)
-    # ロトは同一数字が出ない想定だが、入力ゆれに備えて重複排除
-    nums = sorted(set(nums))
-    return nums
+    # 回号抽出（任意）
+    m = re.search(r"(?:第)?\s*(\d+)\s*(?:回)?", raw)
+    round_no = int(m.group(1)) if m else None
 
-def parse_paste_block(text: str, spec: GameSpec) -> List[Tuple[Tuple[int, ...], Optional[int]]]:
-    """
-    コピペされた行から本数字と（あれば）ボーナスを抽出。
-    例：
-      第2067回 3,4,12,15,32,33,34
-      2068回 5 7 8 9 10 11 B 13
-    ルール：
-      - 数字が pick 個以上あれば本数字に採用
-      - 数字が pick+1 個以上なら最後の1つをボーナスとして採用（範囲チェックあり）
-    """
-    if not text or not text.strip():
-        return []
+    # B / BONUS の位置で分割
+    # "B34" "B 34" "B: 34 35" "bonus 34" などを許容
+    bonus_part = ""
+    main_part = raw
 
-    lines = [ln.strip() for ln in text.strip().splitlines() if ln.strip()]
-    out: List[Tuple[Tuple[int, ...], Optional[int]]] = []
-    for ln in lines:
-        # 回号っぽい表現を削除（第2067回、2067回 など）
-        ln2 = re.sub(r"第?\s*\d+\s*回", " ", ln)
-        ln2 = re.sub(r"[\(\)（）]", " ", ln2)
-        ln2 = ln2.replace("、", ",").replace("　", " ")
-        # B/ボーナス等の表記は区切りに
-        ln2 = re.sub(r"[Bb]\s*[:=]?\s*", " ", ln2)
-        ln2 = ln2.replace("ボーナス", " ").replace("bonus", " ")
-        parts = re.split(r"[\s,]+", ln2.strip())
-        nums = [_safe_int(p) for p in parts]
-        nums = [n for n in nums if n is not None]
+    bm = re.search(r"\b(B|BONUS|ボーナス)\b[:：]?", raw, flags=re.IGNORECASE)
+    if bm:
+        idx = bm.start()
+        main_part = raw[:idx]
+        bonus_part = raw[idx:]
+        # BやBONUS文字を削る
+        bonus_part = re.sub(r"\b(B|BONUS|ボーナス)\b[:：]?", " ", bonus_part, flags=re.IGNORECASE)
 
-        if len(nums) < spec.pick:
+    # 数字トークン抽出
+    main_tokens = re.findall(r"\d+", main_part)
+    bonus_tokens = re.findall(r"\d+", bonus_part)
+
+    # main_tokens の先頭が回号になっているケース（第2067回 ...）があるので除外
+    # 「回号らしき」数字が先頭で、残りが成立する場合にだけ除外する
+    if len(main_tokens) >= 1:
+        maybe_round = int(main_tokens[0])
+        rest = main_tokens[1:]
+        # rest が main+bonus を満たしそうなら先頭を回号とみなす
+        if len(rest) >= spec.n_main:
+            # round_no が取れてない場合にのみ強めに採用
+            if round_no is None or round_no == maybe_round:
+                round_no = maybe_round
+                main_tokens = rest
+
+    nums_main = [int(x) for x in main_tokens]
+    nums_bonus = [int(x) for x in bonus_tokens]
+
+    # バリデーション
+    # main は spec.n_main 個必要（余分が混ざったら後ろを落とす）
+    if len(nums_main) < spec.n_main:
+        return None
+    nums_main = nums_main[: spec.n_main]
+
+    # 範囲チェック
+    if any(n < 1 or n > spec.max_num for n in nums_main):
+        return None
+
+    # 重複排除（main側）
+    if len(set(nums_main)) != len(nums_main):
+        # 重複があると成立しないので None
+        return None
+
+    # bonus
+    nums_bonus = [n for n in nums_bonus if 1 <= n <= spec.max_num and n not in nums_main]
+    nums_bonus = nums_bonus[: spec.n_bonus]  # ロト6=1個、ロト7=2個
+
+    return Draw(round_no=round_no, main=tuple(sorted(nums_main)), bonus=tuple(sorted(nums_bonus)))
+
+
+def parse_paste(text: str, spec: GameSpec) -> List[Draw]:
+    draws = []
+    for line in text.splitlines():
+        d = parse_draw_line(line, spec)
+        if d:
+            draws.append(d)
+    return draws
+
+
+def draw_key(d: Draw) -> Tuple[Optional[int], Tuple[int, ...], Tuple[int, ...]]:
+    return (d.round_no, d.main, d.bonus)
+
+
+def add_draws(game_name: str, new_draws: List[Draw]) -> int:
+    keyset: Set = st.session_state.history_keyset[game_name]
+    hist: List[Draw] = st.session_state.history[game_name]
+    added = 0
+    for d in new_draws:
+        k = draw_key(d)
+        if k in keyset:
             continue
+        keyset.add(k)
+        hist.append(d)
+        added += 1
+    # 回号がある場合は回号順に揃える
+    hist.sort(key=lambda x: (x.round_no if x.round_no is not None else 10**18))
+    return added
 
-        main = nums[:spec.pick]
-        main = normalize_main(main, spec)
-        if len(main) != spec.pick:
-            # 重複などで本数字が不足した場合はスキップ
-            continue
 
-        bonus = None
-        if spec.has_bonus and len(nums) >= spec.pick + 1:
-            b = nums[spec.pick]
-            if b is not None and 1 <= b <= spec.max_n and b not in main:
-                bonus = int(b)
+# =========================
+# 統計・説明
+# =========================
+@dataclass
+class Stats:
+    freq_all: pd.Series
+    freq_recent: pd.Series
+    hot_score: pd.Series
+    last_seen_gap: pd.Series  # 最終出現からの経過回数（近いほど小さい）
+    streak_info: Dict[int, str]  # 短期で多い・短期で連発など
 
-        out.append((tuple(main), bonus))
-    return out
 
-def detect_encoding_and_read_csv(uploaded_file) -> pd.DataFrame:
-    raw = uploaded_file.getvalue() if hasattr(uploaded_file, "getvalue") else uploaded_file.read()
-    encodings = ["utf-8-sig", "utf-8", "cp932", "shift_jis", "euc_jp"]
-    last_err = None
-    for enc in encodings:
-        try:
-            return pd.read_csv(io.BytesIO(raw), encoding=enc)
-        except Exception as e:
-            last_err = e
-    raise last_err
+def compute_stats(draws: List[Draw], spec: GameSpec, recent_n: int = 30) -> Stats:
+    if len(draws) == 0:
+        idx = pd.Index(range(1, spec.max_num + 1), name="num")
+        z = pd.Series([0] * spec.max_num, index=idx, dtype=float)
+        return Stats(z, z, z, z, {})
 
-def standardize_draw_csv(df: pd.DataFrame, spec: GameSpec) -> pd.DataFrame:
-    """
-    CSV列を内部形式へ正規化：n1..nK + bonus
-    想定：抽選履歴CSV（銀行明細CSVなどは対象外）
-    """
-    if spec.pick == 6:
-        candidates = [
-            [f"抽せん数字{i}" for i in range(1, 7)],
-            [f"抽選数字{i}" for i in range(1, 7)],
-            [f"本数字{i}" for i in range(1, 7)],
-        ]
-    else:
-        candidates = [
-            [f"本数字{i}" for i in range(1, 8)],
-            [f"抽せん数字{i}" for i in range(1, 8)],
-            [f"抽選数字{i}" for i in range(1, 8)],
-        ]
+    # mainだけで分析（ボーナスは参考情報として別扱い）
+    all_nums = list(itertools.chain.from_iterable([d.main for d in draws]))
+    freq_all = pd.Series(all_nums).value_counts().reindex(range(1, spec.max_num + 1), fill_value=0).sort_index()
 
-    num_cols = None
-    for arr in candidates:
-        if all(a in df.columns for a in arr):
-            num_cols = arr
-            break
+    recent_draws = draws[-recent_n:] if len(draws) >= 1 else draws
+    recent_nums = list(itertools.chain.from_iterable([d.main for d in recent_draws]))
+    freq_recent = pd.Series(recent_nums).value_counts().reindex(range(1, spec.max_num + 1), fill_value=0).sort_index()
 
-    if num_cols is None:
-        # 推測：数値列から上位K列
-        numeric_cols = []
-        for c in df.columns:
-            s = pd.to_numeric(df[c], errors="coerce")
-            if s.notna().sum() >= max(1, len(df) // 3):
-                numeric_cols.append(c)
-        if len(numeric_cols) >= spec.pick:
-            num_cols = numeric_cols[: spec.pick]
-        else:
-            raise ValueError("抽選履歴CSVの列構造ではありません（数字列が不足）。")
+    # Hot/Cold：最近比率 vs 全体比率（単純化）
+    total_all = max(1, len(all_nums))
+    total_recent = max(1, len(recent_nums))
+    rate_all = freq_all / total_all
+    rate_recent = freq_recent / total_recent
+    hot_score = (rate_recent - rate_all)  # 正がホット寄り、負がコールド寄り
 
-    bonus_col = None
-    for bc in ["ボーナス数字", "ﾎﾞｰﾅｽ数字", "BONUS", "bonus"]:
-        if bc in df.columns:
-            bonus_col = bc
-            break
+    # 最終出現からの経過
+    gaps = {}
+    for n in range(1, spec.max_num + 1):
+        gap = None
+        for i, d in enumerate(reversed(draws), start=0):
+            if n in d.main:
+                gap = i
+                break
+        gaps[n] = gap if gap is not None else len(draws)
+    last_seen_gap = pd.Series(gaps).sort_index()
 
-    out = pd.DataFrame()
-    for i, c in enumerate(num_cols, start=1):
-        out[f"n{i}"] = pd.to_numeric(df[c], errors="coerce").astype("Int64")
+    # “納得できる説明” の種（短期で多い・短期で連発）
+    streak_info = {}
+    short_n = min(20, len(draws))
+    short = draws[-short_n:]
+    count_short = pd.Series(list(itertools.chain.from_iterable([d.main for d in short]))).value_counts()
+    for n in range(1, spec.max_num + 1):
+        c = int(count_short.get(n, 0))
+        if c >= 3:
+            streak_info[n] = f"直近{short_n}回で{c}回出現（短期で多め）"
+    return Stats(freq_all=freq_all, freq_recent=freq_recent, hot_score=hot_score, last_seen_gap=last_seen_gap, streak_info=streak_info)
 
-    if spec.has_bonus and bonus_col:
-        out["bonus"] = pd.to_numeric(df[bonus_col], errors="coerce").astype("Int64")
-    else:
-        out["bonus"] = pd.Series([pd.NA] * len(df), dtype="Int64")
 
-    out = out.dropna(subset=[f"n{i}" for i in range(1, spec.pick + 1)], how="any").reset_index(drop=True)
-    return out
+def decade(n: int) -> int:
+    return (n - 1) // 10  # 1-10=0, 11-20=1 ...
 
-@st.cache_data(show_spinner=False)
-def calc_freq_main(hist: pd.DataFrame, spec: GameSpec) -> pd.Series:
-    vals = hist[[f"n{i}" for i in range(1, spec.pick + 1)]].to_numpy().flatten()
-    vals = vals[~pd.isna(vals)].astype(int)
-    s = pd.Series(vals).value_counts().sort_index()
-    return s.reindex(range(1, spec.max_n + 1), fill_value=0)
 
-@st.cache_data(show_spinner=False)
-def calc_freq_bonus(hist: pd.DataFrame, spec: GameSpec) -> pd.Series:
-    if "bonus" not in hist.columns:
-        return pd.Series([0]*spec.max_n, index=range(1, spec.max_n+1))
-    vals = hist["bonus"].dropna().astype(int).to_numpy()
-    s = pd.Series(vals).value_counts().sort_index()
-    return s.reindex(range(1, spec.max_n + 1), fill_value=0)
-
-def violates_consecutive(nums: List[int], k: int = 3) -> bool:
+def has_3_consecutive(nums: List[int]) -> bool:
+    s = sorted(nums)
     run = 1
-    for i in range(1, len(nums)):
-        if nums[i] == nums[i - 1] + 1:
+    for i in range(1, len(s)):
+        if s[i] == s[i - 1] + 1:
             run += 1
-            if run >= k:
+            if run >= 3:
                 return True
         else:
             run = 1
     return False
 
-def decade_bucket(n: int) -> int:
-    # 1-9:0, 10-19:1, 20-29:2...
-    return n // 10
 
-def decade_skew(nums: List[int]) -> int:
-    buckets: Dict[int, int] = {}
-    for n in nums:
-        b = decade_bucket(n)
-        buckets[b] = buckets.get(b, 0) + 1
-    return max(buckets.values()) if buckets else 0
+# =========================
+# 候補生成
+# =========================
+@st.cache_data(show_spinner=False)
+def _cached_stats(draws_serialized: List[Tuple[Optional[int], Tuple[int, ...], Tuple[int, ...]]], spec: GameSpec, recent_n: int):
+    draws = [Draw(r, m, b) for (r, m, b) in draws_serialized]
+    return compute_stats(draws, spec, recent_n=recent_n)
 
-def is_birthday_heavy(nums: List[int], threshold: int) -> bool:
-    return sum(1 <= n <= 31 for n in nums) >= threshold
 
-def weighted_choice(numbers: np.ndarray, weights: np.ndarray, k: int, forbid: Optional[set]=None) -> List[int]:
-    forbid = forbid or set()
-    mask = np.array([n not in forbid for n in numbers])
-    nums2 = numbers[mask]
-    w2 = weights[mask]
-    w2 = w2 / w2.sum()
-    pick = np.random.choice(nums2, size=k, replace=False, p=w2)
-    return [int(x) for x in pick]
+def get_stats_cached(draws: List[Draw], spec: GameSpec, recent_n: int) -> Stats:
+    ser = [(d.round_no, d.main, d.bonus) for d in draws]
+    return _cached_stats(ser, spec, recent_n)
 
-def gen_candidates(hist: pd.DataFrame, spec: GameSpec, n: int, bias: float,
-                   avoid_consec: bool, avoid_bday: bool, max_decade: int,
-                   gen_bonus: bool, seed: Optional[int] = None) -> pd.DataFrame:
-    """
-    本数字 +（任意で）ボーナス を生成。
-    bias: -1(cold) ... 0 ... +1(hot)
-    """
-    if seed is not None:
-        random.seed(seed)
-        np.random.seed(seed)
 
-    freq = calc_freq_main(hist, spec).astype(float) + 1.0  # 平滑化
-    p = 1.2 + abs(bias) * 1.8
-    if bias >= 0:
-        w = np.power(freq.to_numpy(), p)
-    else:
-        w = np.power(1.0 / freq.to_numpy(), p)
+def weighted_sample_without_replacement(items: List[int], weights: np.ndarray, k: int, rng: np.random.Generator) -> List[int]:
+    # weights が全部0のときの保険
+    w = weights.astype(float).copy()
+    if np.all(w <= 0):
+        w = np.ones_like(w)
+    w = np.maximum(w, 1e-12)
     w = w / w.sum()
-    numbers = np.arange(1, spec.max_n + 1)
 
-    # ボーナス用の重み（あれば）
-    b_w = None
-    if gen_bonus and spec.has_bonus:
-        bfreq = calc_freq_bonus(hist, spec).astype(float) + 1.0
-        if bias >= 0:
-            b_w = np.power(bfreq.to_numpy(), p)
-        else:
-            b_w = np.power(1.0 / bfreq.to_numpy(), p)
-        b_w = b_w / b_w.sum()
+    chosen = []
+    pool = items.copy()
+    w_pool = w.copy()
+    for _ in range(k):
+        idx = rng.choice(len(pool), p=w_pool)
+        chosen.append(pool.pop(idx))
+        w_pool = np.delete(w_pool, idx)
+        if len(pool) == 0:
+            break
+        w_pool = w_pool / w_pool.sum()
+    return chosen
 
-    rows = []
+
+def generate_candidates(
+    draws: List[Draw],
+    spec: GameSpec,
+    k_candidates: int,
+    recent_n: int,
+    bias_hot: float,   # 0..1（0=コールド寄り、1=ホット寄り）
+    avoid_3consec: bool,
+    avoid_single_decade: bool,
+    rng_seed: Optional[int] = None,
+) -> List[Dict]:
+    stats = get_stats_cached(draws, spec, recent_n=recent_n)
+    nums = list(range(1, spec.max_num + 1))
+
+    # 重み設計：全体頻度 + ホットスコアを混ぜる（極端になりすぎないように）
+    base = (stats.freq_all + 1).astype(float)  # 0回でも1
+    hot = stats.hot_score
+    # hot を 0..1 に正規化して使う（負もあるので）
+    hot_norm = (hot - hot.min()) / (hot.max() - hot.min() + 1e-9)
+    cold_norm = 1.0 - hot_norm
+
+    mix = bias_hot * hot_norm + (1.0 - bias_hot) * cold_norm
+    weights = base.values * (0.65 + 0.70 * mix)  # 係数で穏やかに
+
+    rng = np.random.default_rng(rng_seed if rng_seed is not None else int(time.time()))
+
+    out = []
     tries = 0
-    max_tries = max(7000, n * 250)
+    max_tries = k_candidates * 120
 
-    seen = set()
-    while len(rows) < n and tries < max_tries:
+    while len(out) < k_candidates and tries < max_tries:
         tries += 1
-        main = weighted_choice(numbers, w, spec.pick)
-        main = sorted(main)
+        picked = sorted(weighted_sample_without_replacement(nums, weights, spec.n_main, rng))
 
-        if avoid_consec and violates_consecutive(main, 3):
+        if avoid_3consec and has_3_consecutive(picked):
             continue
-        if avoid_bday and is_birthday_heavy(main, threshold=max(5, spec.pick - 1)):
-            continue
-        if decade_skew(main) > max_decade:
-            continue
+        if avoid_single_decade:
+            decs = {decade(x) for x in picked}
+            if len(decs) == 1:
+                continue
 
-        bonus = None
-        if b_w is not None:
-            # ボーナスは本数字と重複させない
-            bonus = weighted_choice(numbers, b_w, 1, forbid=set(main))[0]
+        # ボーナス候補：残りから重み上位を選ぶ（見やすさ優先で「候補のボーナス」を出す）
+        remaining = [n for n in nums if n not in picked]
+        rem_w = np.array([weights[n - 1] for n in remaining], dtype=float)
+        bonus = sorted(weighted_sample_without_replacement(remaining, rem_w, spec.n_bonus, rng))
 
-        key = (tuple(main), bonus)
-        if key in seen:
-            continue
-        seen.add(key)
+        # “納得用”の簡易理由
+        reasons = []
+        for n in picked:
+            if n in stats.streak_info:
+                reasons.append(f"{n}: {stats.streak_info[n]}")
+        if len(reasons) == 0:
+            reasons.append("直近傾向（ホット/コールド）と全体頻度のバランスから生成")
 
-        row = {f"n{i}": main[i-1] for i in range(1, spec.pick+1)}
-        row["bonus"] = bonus
-        rows.append(row)
-
-    return pd.DataFrame(rows)
-
-def explain_trends(hist: pd.DataFrame, spec: GameSpec, recent_n: int = 30) -> Dict[str, str]:
-    """
-    “納得しやすい説明”を作るための簡易コメント生成。
-    注意：抽選は独立のため確率が変わるわけではない。その前提で「買い方のルール化」材料として提示。
-    """
-    freq_all = calc_freq_main(hist, spec)
-    hist_recent = hist.tail(min(recent_n, len(hist)))
-    freq_recent = calc_freq_main(hist_recent, spec)
-
-    # 10番台トレンド（直近と全体の差）
-    def decade_counts(freq: pd.Series):
-        counts = {}
-        for n, c in freq.items():
-            b = decade_bucket(int(n))
-            counts[b] = counts.get(b, 0) + int(c)
-        return counts
-
-    dc_all = decade_counts(freq_all)
-    dc_recent = decade_counts(freq_recent)
-
-    # 直近の比率が高い10番台を抽出
-    messages = {}
-
-    total_all = sum(dc_all.values()) or 1
-    total_recent = sum(dc_recent.values()) or 1
-    ratios = []
-    for b in sorted(set(dc_all) | set(dc_recent)):
-        r_all = dc_all.get(b, 0) / total_all
-        r_rec = dc_recent.get(b, 0) / total_recent
-        ratios.append((b, r_rec - r_all, r_rec, r_all))
-    ratios.sort(key=lambda x: x[1], reverse=True)
-
-    if ratios:
-        top = ratios[0]
-        b = top[0]
-        label = f"{b*10}番台" if b > 0 else "1〜9"
-        messages["decade"] = (
-            f"直近{recent_n}回では、全期間に比べて「{label}」の比率がやや高めです。"
-            "ただし抽選は独立なので、確率が変化するわけではありません。"
-            "買い方のルール化として、該当帯を少し厚めにする判断材料にできます。"
+        out.append(
+            {
+                "main": picked,
+                "bonus": bonus,
+                "reason": " / ".join(reasons[:3]),
+            }
         )
 
-    # “短期間に3回以上” 出ている数字（過密）
-    # 直近W回での出現回数を見て抽出
-    W = min(30, len(hist))
-    freq_w = calc_freq_main(hist.tail(W), spec)
-    crowded = freq_w[freq_w >= 3].index.tolist()
-    if crowded:
-        s = "、".join(map(str, crowded[:10]))
-        messages["crowded"] = (
-            f"直近{W}回の中で3回以上出ている数字があります（例：{s}）。"
-            "『短期で出すぎだから次は控える』という買い方ルールを作るなら、ここが候補になります。"
-        )
-    else:
-        messages["crowded"] = f"直近{W}回で3回以上出ている数字は見当たりませんでした。"
+    return out
 
-    # “長期間出ていない”数字（空白）
-    # 最終出現からの距離を計算
-    last_seen = {n: None for n in range(1, spec.max_n+1)}
-    main_cols = [f"n{i}" for i in range(1, spec.pick+1)]
-    for idx, row in hist[main_cols].iterrows():
-        for n in row.tolist():
-            last_seen[int(n)] = idx
-    cur = len(hist)-1
-    gaps = []
-    for n, idx in last_seen.items():
-        if idx is None:
-            gaps.append((n, 10**9))
-        else:
-            gaps.append((n, cur-idx))
-    gaps.sort(key=lambda x: x[1], reverse=True)
-    topg = gaps[:10]
-    messages["gaps"] = "最近出ていない順（回数差）：" + " / ".join([f"{n}({g})" for n,g in topg])
 
-    return messages
+# =========================
+# バックテスト（簡易）
+# =========================
+def backtest(
+    draws: List[Draw],
+    spec: GameSpec,
+    test_last_n: int = 50,
+    train_window: int = 80,
+    candidates_per_round: int = 30,
+    recent_n: int = 30,
+    bias_hot: float = 0.6,
+    avoid_3consec: bool = True,
+    avoid_single_decade: bool = True,
+) -> pd.DataFrame:
+    if len(draws) < (test_last_n + 5):
+        return pd.DataFrame()
 
-def style_candidates(df: pd.DataFrame, spec: GameSpec) -> pd.io.formats.style.Styler:
-    df2 = df.copy()
-    # 表示用に bonus を "B:xx" に
-    def fmt_bonus(x):
-        if pd.isna(x) or x is None:
-            return ""
-        return f"B:{int(x)}"
-    df2["bonus"] = df2["bonus"].apply(fmt_bonus)
-
-    def highlight_bonus(val):
-        if isinstance(val, str) and val.startswith("B:"):
-            return "background-color: #fef3c7; color:#0f172a; font-weight:700;"
-        return ""
-
-    sty = df2.style.applymap(highlight_bonus, subset=["bonus"])
-    return sty
-
-def match_score(draw_main: List[int], draw_bonus: Optional[int], cand_main: List[int], cand_bonus: Optional[int]) -> Tuple[int, bool]:
-    main_hit = len(set(draw_main) & set(cand_main))
-    bonus_hit = (draw_bonus is not None and cand_bonus is not None and int(draw_bonus) == int(cand_bonus))
-    return main_hit, bool(bonus_hit)
-
-def run_backtest(hist: pd.DataFrame, spec: GameSpec, train_window: int, test_last: int, n_cands: int,
-                 bias: float, avoid_consec: bool, avoid_bday: bool, max_decade: int, gen_bonus: bool, seed: Optional[int]) -> pd.DataFrame:
-    main_cols = [f"n{i}" for i in range(1, spec.pick+1)]
+    start = max(0, len(draws) - test_last_n)
     rows = []
-    N = len(hist)
-    start = max(train_window, N - test_last)
-    for t in range(start, N):
-        train = hist.iloc[t-train_window:t].copy()
-        test_row = hist.iloc[t]
-        draw_main = [int(test_row[c]) for c in main_cols]
-        draw_bonus = _safe_int(test_row.get("bonus", None))
 
-        cands = gen_candidates(train, spec, n=n_cands, bias=bias,
-                               avoid_consec=avoid_consec, avoid_bday=avoid_bday,
-                               max_decade=max_decade, gen_bonus=gen_bonus, seed=seed)
+    for idx in range(start, len(draws)):
+        target = draws[idx]
+        train_start = max(0, idx - train_window)
+        train = draws[train_start:idx]
 
-        best_main = -1
-        best_bonus = False
-        for _, r in cands.iterrows():
-            cand_main = [int(r[c]) for c in main_cols]
-            cand_bonus = _safe_int(r.get("bonus", None))
-            m, b = match_score(draw_main, draw_bonus, cand_main, cand_bonus)
-            if (m > best_main) or (m == best_main and b and not best_bonus):
-                best_main, best_bonus = m, b
+        cands = generate_candidates(
+            train, spec,
+            k_candidates=candidates_per_round,
+            recent_n=recent_n,
+            bias_hot=bias_hot,
+            avoid_3consec=avoid_3consec,
+            avoid_single_decade=avoid_single_decade,
+            rng_seed=idx + 12345
+        )
 
-        rows.append({
-            "対象Index": t,
-            "本数字ヒット最大": best_main,
-            "ボーナス一致": best_bonus,
-        })
+        best_hit = 0
+        best_main = None
+        for c in cands:
+            hit = len(set(c["main"]) & set(target.main))
+            if hit > best_hit:
+                best_hit = hit
+                best_main = c["main"]
+
+        rows.append(
+            {
+                "round": target.round_no,
+                "target_main": " ".join(map(str, target.main)),
+                "target_bonus": " ".join(map(str, target.bonus)) if target.bonus else "",
+                "best_hit_main": best_hit,
+                "best_candidate_main": " ".join(map(str, best_main)) if best_main else "",
+            }
+        )
+
     return pd.DataFrame(rows)
 
-# -----------------------------
-# セッション初期化
-# -----------------------------
-def ensure_state():
-    if "spec_name" not in st.session_state:
-        st.session_state.spec_name = LOTO6.name
-    if "history" not in st.session_state:
-        st.session_state.history = pd.DataFrame()
-    if "paste_box" not in st.session_state:
-        st.session_state.paste_box = ""
-    if "auto_import" not in st.session_state:
-        st.session_state.auto_import = True
-    if "seen_keys" not in st.session_state:
-        st.session_state.seen_keys = set()
 
-ensure_state()
-
-# -----------------------------
+# =========================
 # ヘッダー
-# -----------------------------
-st.markdown(f"<div class='badge'>{APP_TITLE}</div>", unsafe_allow_html=True)
-st.markdown(f"<h2 style='margin-top:10px'>{APP_SUB}</h2>", unsafe_allow_html=True)
-st.markdown("<div class='notice'>当せんや利益を保証するものではありません。分析結果は「買い方のルール化」や「記録の手間削減」のためにご利用ください。</div>", unsafe_allow_html=True)
+# =========================
+st.markdown(
+    """
+    <div class="topline">
+      <div class="badge">ロト6・ロト7分析ツール</div>
+      <div class="badge2">貼り付け → 自動取り込み → 分析 → 候補生成（ボーナス対応）</div>
+    </div>
+    """,
+    unsafe_allow_html=True,
+)
 
-# -----------------------------
-# サイドバー
-# -----------------------------
-spec = LOTO6 if st.session_state.spec_name == LOTO6.name else LOTO7
+st.markdown(
+    "<div class='notice'>当せんや利益を保証するものではありません。分析結果は「買い方のルール化」や「記録の手間削減」のためにご利用ください。</div>",
+    unsafe_allow_html=True,
+)
 
-with st.sidebar:
-    st.subheader("対象ゲーム")
-    game = st.radio("ロト", [LOTO6.name, LOTO7.name], index=0 if spec == LOTO6 else 1)
-    st.session_state.spec_name = game
-    spec = LOTO6 if game == LOTO6.name else LOTO7
 
-    st.divider()
-    st.subheader("入力オプション")
-    st.session_state.auto_import = st.toggle("貼り付け自動取り込み", value=st.session_state.auto_import,
-                                             help="ONなら、貼り付け欄の内容を検知して自動で履歴に追加します（重複は追加しません）。")
-
-    st.divider()
-    st.subheader("候補生成")
-    bias = st.slider("ホット / コールド寄り", -1.0, 1.0, 0.3, 0.1,
-                     help="-1=コールド寄り / +1=ホット寄り（傾向を“強める”だけで確率を変えるものではありません）")
-    n_cands = st.number_input("生成数", min_value=1, max_value=300, value=30, step=1)
-    gen_bonus = st.checkbox("ボーナスも生成", value=True, help="ONで候補にボーナス（B）も付けます。")
-    avoid_consec = st.checkbox("3連番以上を除外", value=True)
-    avoid_bday = st.checkbox("誕生日数字の偏りを除外", value=True)
-    max_dec = st.slider("同じ10番台の最大個数", min_value=2, max_value=spec.pick, value=min(4, spec.pick), step=1)
-    seed_txt = st.text_input("再現用シード（任意）", value="", help="数値を入れると同じ結果を再現しやすいです。")
-
-# -----------------------------
-# 自動取り込みコールバック
-# -----------------------------
-def import_from_paste():
-    text = st.session_state.paste_box
-    parsed = parse_paste_block(text, spec)
-    if not parsed:
-        return
-    # 履歴に追加（重複除外）
-    add_rows = []
-    for main, bonus in parsed:
-        key = (spec.name, main, bonus)
-        if key in st.session_state.seen_keys:
-            continue
-        st.session_state.seen_keys.add(key)
-        row = {f"n{i}": main[i-1] for i in range(1, spec.pick+1)}
-        row["bonus"] = bonus
-        add_rows.append(row)
-
-    if add_rows:
-        df_new = pd.DataFrame(add_rows)
-        # spec切替時に列が変わるので整合をとる
-        if st.session_state.history is None or len(st.session_state.history) == 0:
-            st.session_state.history = df_new.copy()
-        else:
-            # 列が違う場合は上書き（ゲーム切替に追従）
-            if set(st.session_state.history.columns) != set(df_new.columns):
-                st.session_state.history = df_new.copy()
-            else:
-                st.session_state.history = pd.concat([st.session_state.history, df_new], ignore_index=True)
-
-# -----------------------------
-# タブ
-# -----------------------------
+# =========================
+# UI
+# =========================
 tabs = st.tabs(["入力", "分析", "生成", "バックテスト", "設定メモ"])
 
-# -----------------------------
-# 入力
-# -----------------------------
 with tabs[0]:
     st.markdown("<div class='card'>", unsafe_allow_html=True)
-    st.subheader("貼り付け（おすすめ）")
-    st.markdown("<div class='mini'>例：第2067回 3,4,12,15,32,33,34（最後がボーナス） / 2068回 5 7 8 9 10 11 B 13</div>", unsafe_allow_html=True)
+    left, right = st.columns([1.2, 1.0], gap="large")
 
-    # on_change で自動取り込み
-    st.text_area(
-        "抽選結果を貼り付け",
-        key="paste_box",
-        height=120,
-        on_change=(import_from_paste if st.session_state.auto_import else None),
-    )
+    with left:
+        game_name = st.selectbox("ゲーム", ["ロト6", "ロト7"], index=0)
+        spec = GAME_MAP[game_name]
 
-    col1, col2, col3 = st.columns([1, 1, 1])
-    if col1.button("手動で履歴に追加", use_container_width=True):
-        import_from_paste()
-        st.success("追加しました（重複は自動で除外）。")
+        auto_import = st.toggle("貼り付けを自動で履歴に取り込み（おすすめ）", value=True)
+        recent_n = st.slider("ホット/コールド算出（直近N回）", 10, 80, 30, step=5)
 
-    if col2.button("貼り付け欄をクリア", use_container_width=True):
-        st.session_state.paste_box = ""
+        st.caption("貼り付け例：")
+        if spec == LOTO6:
+            st.code("第2067回 3,4,12,15,32,33 B34\n第2068回 5 7 8 9 10 11 B13", language="text")
+        else:
+            st.code("第600回 1,5,7,12,18,21,33 B2 35\n第601回 3 6 9 11 17 24 31 B:1 22", language="text")
 
-    if col3.button("履歴をリセット", use_container_width=True):
-        st.session_state.history = pd.DataFrame()
-        st.session_state.seen_keys = set()
-        st.success("履歴をリセットしました。")
+        paste = st.text_area(
+            "抽選結果を貼り付け（複数行OK）",
+            value=st.session_state.paste_text,
+            height=160,
+            placeholder="ここに貼り付け…",
+        )
+        st.session_state.paste_text = paste
 
-    st.markdown("<div class='hr'></div>", unsafe_allow_html=True)
-    st.subheader("CSV取り込み（任意）")
-    up = st.file_uploader("抽選履歴CSVをアップロード", type=["csv"])
-    if up is not None:
-        try:
-            df_raw = detect_encoding_and_read_csv(up)
-            df_std = standardize_draw_csv(df_raw, spec)
-            st.session_state.history = df_std.copy()
-            # seen_keys を再構築（重複除外のため）
-            keys = set()
-            main_cols = [f"n{i}" for i in range(1, spec.pick+1)]
-            for _, r in df_std.iterrows():
-                main = tuple(int(r[c]) for c in main_cols)
-                bonus = _safe_int(r.get("bonus", None))
-                keys.add((spec.name, main, bonus))
-            st.session_state.seen_keys = keys
-            st.success(f"CSVを読み込みました（{len(df_std)}行）。")
-        except Exception as e:
-            st.error(
-                "CSVの読み込みに失敗しました。\n\n"
-                "・このツールは『抽選履歴CSV』を想定しています（銀行明細CSVなどは対象外）。\n"
-                f"・必要：{spec.pick}個の数字列（本数字/抽せん数字など）。\n\n"
-                f"エラー：{e}"
+        # 自動取り込み（テキストが変わったらパースして追加）
+        if auto_import:
+            if st.session_state.paste_text != st.session_state.last_processed_text:
+                new_draws = parse_paste(st.session_state.paste_text, spec)
+                added = add_draws(game_name, new_draws)
+                st.session_state.last_processed_text = st.session_state.paste_text
+                if added > 0:
+                    st.success(f"履歴に追加しました：{added}行（重複は自動で除外）")
+                elif len(new_draws) == 0 and st.session_state.paste_text.strip():
+                    st.warning("追加できる行が見つかりませんでした。形式と数字個数を確認してください。")
+
+        colb1, colb2, colb3 = st.columns([1, 1, 1])
+        with colb1:
+            if st.button("貼り付け内容を履歴に追加（手動）"):
+                new_draws = parse_paste(st.session_state.paste_text, spec)
+                added = add_draws(game_name, new_draws)
+                if added > 0:
+                    st.success(f"履歴に追加しました：{added}行（重複は自動で除外）")
+                else:
+                    st.warning("追加できる行が見つかりませんでした。形式と数字個数を確認してください。")
+        with colb2:
+            if st.button("貼り付け欄をクリア"):
+                st.session_state.paste_text = ""
+                st.session_state.last_processed_text = ""
+                st.rerun()
+        with colb3:
+            if st.button("履歴をリセット（このゲームのみ）"):
+                st.session_state.history[game_name] = []
+                st.session_state.history_keyset[game_name] = set()
+                st.rerun()
+
+    with right:
+        hist = st.session_state.history[game_name]
+        st.subheader("現在の履歴")
+        st.caption(f"{game_name}: {len(hist)}行")
+        if len(hist) == 0:
+            st.info("まだ履歴がありません。左側に貼り付けてください。")
+        else:
+            df = pd.DataFrame(
+                [
+                    {
+                        "回号": d.round_no,
+                        "本数字": " ".join(map(str, d.main)),
+                        "ボーナス": " ".join(map(str, d.bonus)) if d.bonus else "",
+                    }
+                    for d in hist[-50:]
+                ]
             )
+            st.dataframe(df, use_container_width=True, hide_index=True)
 
-    st.markdown("<div class='hr'></div>", unsafe_allow_html=True)
-    st.subheader("現在の履歴（最新10行）")
-    hist = st.session_state.history
-    if hist is None or len(hist) == 0:
-        st.info("履歴がまだありません。貼り付けかCSVで追加してください。")
-    else:
-        st.dataframe(hist.tail(10), use_container_width=True, height=320)
+        st.markdown("<div class='warn'>ボーナス数字の入れ方：末尾に <b>B</b> を付けてください。例：<br>ロト6 → … <b>B34</b><br>ロト7 → … <b>B2 35</b></div>", unsafe_allow_html=True)
 
     st.markdown("</div>", unsafe_allow_html=True)
 
-# -----------------------------
-# 分析
-# -----------------------------
 with tabs[1]:
-    hist = st.session_state.history
-    if hist is None or len(hist) == 0:
-        st.info("分析するには履歴を追加してください。")
+    game_name = st.selectbox("ゲーム（分析）", ["ロト6", "ロト7"], index=0, key="game_analysis")
+    spec = GAME_MAP[game_name]
+    hist = st.session_state.history[game_name]
+
+    st.markdown("<div class='card'>", unsafe_allow_html=True)
+    st.subheader("分析")
+    if len(hist) == 0:
+        st.info("分析するには、まず履歴を追加してください。")
+        st.markdown("</div>", unsafe_allow_html=True)
     else:
-        st.markdown("<div class='card'>", unsafe_allow_html=True)
-        st.subheader("サマリー")
+        recent_n = st.slider("直近N回（分析）", 10, 80, 30, step=5, key="recent_analysis")
+        stats = get_stats_cached(hist, spec, recent_n=recent_n)
 
-        freq = calc_freq_main(hist, spec)
-        bfq = calc_freq_bonus(hist, spec) if spec.has_bonus else None
-        total_draws = len(hist)
-
-        c1, c2, c3, c4 = st.columns(4)
-        c1.metric("履歴行数", f"{total_draws}")
-        c2.metric("最大数字", f"{spec.max_n}")
-        c3.metric("ホット上位の最大回数", f"{int(freq.max())}")
-        c4.metric("コールド最小回数", f"{int(freq.min())}")
-
-        st.markdown("<div class='hr'></div>", unsafe_allow_html=True)
-
-        st.subheader("ホット / コールド（本数字）")
-        df_freq = pd.DataFrame({"数字": freq.index, "回数": freq.values})
-        colA, colB = st.columns(2)
-        with colA:
-            st.caption("ホット上位（回数が多い）")
-            st.table(df_freq.sort_values("回数", ascending=False).head(12))
-        with colB:
-            st.caption("コールド上位（回数が少ない）")
-            st.table(df_freq.sort_values("回数", ascending=True).head(12))
-
-        if spec.has_bonus:
-            st.markdown("<div class='hr'></div>", unsafe_allow_html=True)
-            st.subheader("ボーナス（B）の頻度")
-            df_b = pd.DataFrame({"数字": bfq.index, "回数": bfq.values})
-            col1, col2 = st.columns(2)
-            with col1:
-                st.caption("ボーナスのホット上位")
-                st.table(df_b.sort_values("回数", ascending=False).head(10))
-            with col2:
-                st.caption("ボーナスのコールド上位")
-                st.table(df_b.sort_values("回数", ascending=True).head(10))
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            st.markdown("### Hot（直近で増加）")
+            hot = stats.hot_score.sort_values(ascending=False).head(10)
+            st.dataframe(pd.DataFrame({"num": hot.index, "hot_score": hot.values}), hide_index=True, use_container_width=True)
+        with c2:
+            st.markdown("### Cold（直近で減少）")
+            cold = stats.hot_score.sort_values(ascending=True).head(10)
+            st.dataframe(pd.DataFrame({"num": cold.index, "hot_score": cold.values}), hide_index=True, use_container_width=True)
+        with c3:
+            st.markdown("### しばらく出てない（ギャップ）")
+            gap = stats.last_seen_gap.sort_values(ascending=False).head(10)
+            st.dataframe(pd.DataFrame({"num": gap.index, "gap": gap.values}), hide_index=True, use_container_width=True)
 
         st.markdown("<div class='hr'></div>", unsafe_allow_html=True)
-        st.subheader("納得しやすい説明（自動コメント）")
-        recent_n = st.slider("直近何回で見る？", 10, 200, 30, 5)
-        msgs = explain_trends(hist, spec, recent_n=recent_n)
-        st.markdown(f"<div class='small'>・{msgs.get('decade','')}</div>", unsafe_allow_html=True)
-        st.markdown(f"<div class='small'>・{msgs.get('crowded','')}</div>", unsafe_allow_html=True)
-        st.markdown(f"<div class='small'>・{msgs.get('gaps','')}</div>", unsafe_allow_html=True)
+
+        # “納得できる説明”を文章化（簡易）
+        st.markdown("### 傾向の説明（自動）")
+        decade_counts = {}
+        # 直近N回の10番代など
+        recent_draws = hist[-recent_n:]
+        for d in recent_draws:
+            for n in d.main:
+                decade_counts[decade(n)] = decade_counts.get(decade(n), 0) + 1
+
+        # 表示
+        lines = []
+        if decade_counts:
+            # 一番多い decade を拾う
+            best_dec = max(decade_counts.items(), key=lambda x: x[1])
+            dec_label = f"{best_dec[0]*10+1}〜{best_dec[0]*10+10}"
+            lines.append(f"直近{recent_n}回では「{dec_label}（いわゆる{best_dec[0]*10}番代）」の出現が相対的に多めです。")
+
+        # 短期連発
+        frequent_short = [f"{n}（{stats.streak_info[n]}）" for n in sorted(stats.streak_info.keys())[:10]]
+        if frequent_short:
+            lines.append("短期で複数回出ている数字： " + "、".join(frequent_short) + " …など。")
+
+        if not lines:
+            lines = ["履歴が少ないため、強い偏りは検出されませんでした。"]
+
+        st.write("\n".join(lines))
 
         st.markdown("</div>", unsafe_allow_html=True)
 
-# -----------------------------
-# 生成
-# -----------------------------
 with tabs[2]:
-    hist = st.session_state.history
-    if hist is None or len(hist) == 0:
-        st.info("候補生成には履歴が必要です。まずは入力タブで履歴を追加してください。")
-    else:
-        st.markdown("<div class='card'>", unsafe_allow_html=True)
-        st.subheader("候補生成")
+    game_name = st.selectbox("ゲーム（生成）", ["ロト6", "ロト7"], index=0, key="game_generate")
+    spec = GAME_MAP[game_name]
+    hist = st.session_state.history[game_name]
 
-        seed_val = None
-        if seed_txt.strip():
-            try:
-                seed_val = int(seed_txt.strip())
-            except Exception:
-                seed_val = None
+    st.markdown("<div class='card'>", unsafe_allow_html=True)
+    st.subheader("候補生成（ボーナス対応）")
 
-        col1, col2 = st.columns([1, 1])
-        with col1:
-            st.markdown("<div class='mini'>ボーナスは <span class='badge-bonus'>B</span> として表示します。</div>", unsafe_allow_html=True)
-        with col2:
-            st.markdown("<div class='mini'>重いときは「生成数」を下げると体感が改善します。</div>", unsafe_allow_html=True)
-
-        if st.button("候補を生成", type="primary"):
-            with st.spinner("生成中…"):
-                t0 = time.time()
-                df_c = gen_candidates(
-                    hist=hist, spec=spec, n=int(n_cands), bias=float(bias),
-                    avoid_consec=bool(avoid_consec), avoid_bday=bool(avoid_bday),
-                    max_decade=int(max_dec), gen_bonus=bool(gen_bonus), seed=seed_val
-                )
-                time.sleep(0.05)
-                t1 = time.time()
-
-            if df_c is None or len(df_c) == 0:
-                st.warning("条件が厳しすぎて候補が生成できませんでした。条件を緩めて再実行してください。")
-            else:
-                st.success(f"{len(df_c)}件を生成しました（{(t1 - t0):.2f}秒）")
-
-                # 表示（ボーナスを目立たせる）
-                sty = style_candidates(df_c, spec)
-                st.dataframe(sty, use_container_width=True, height=420)
-
-                # コピペ用
-                st.subheader("コピペ用（本数字 + ボーナス）")
-                main_cols = [f"n{i}" for i in range(1, spec.pick+1)]
-                lines = []
-                for _, r in df_c.iterrows():
-                    main = [str(int(r[c])) for c in main_cols]
-                    b = r.get("bonus", None)
-                    if pd.isna(b) or b is None:
-                        lines.append(",".join(main))
-                    else:
-                        lines.append(",".join(main) + f",B:{int(b)}")
-                st.text_area("ここをコピー", value="\n".join(lines), height=180)
-
-        st.caption("注意：抽選は独立です。ここでの“納得”は「買い方のルール化」に役立つ説明として提示しています。")
+    if len(hist) == 0:
+        st.info("生成するには、まず履歴を追加してください。")
         st.markdown("</div>", unsafe_allow_html=True)
-
-# -----------------------------
-# バックテスト
-# -----------------------------
-with tabs[3]:
-    hist = st.session_state.history
-    if hist is None or len(hist) == 0:
-        st.info("バックテストには履歴が必要です。まずは入力タブで履歴を追加してください。")
     else:
-        st.markdown("<div class='card'>", unsafe_allow_html=True)
-        st.subheader("バックテスト（簡易）")
-        st.markdown("<div class='mini'>過去の各回を“未来”と見立て、直前の履歴から候補生成→最大ヒット数を集計します。</div>", unsafe_allow_html=True)
+        c1, c2, c3 = st.columns([1.0, 1.0, 1.2])
+        with c1:
+            recent_n = st.slider("直近N回（ホット/コールド）", 10, 80, 30, step=5, key="recent_gen")
+            k_candidates = st.number_input("候補数", min_value=5, max_value=200, value=30, step=5)
+        with c2:
+            bias_hot = st.slider("ホット寄り ↔ コールド寄り", 0.0, 1.0, 0.65, 0.05)
+            avoid_3consec = st.checkbox("3つ以上の連番を避ける", value=True)
+            avoid_single_decade = st.checkbox("同じ10番代だけを避ける", value=True)
+        with c3:
+            st.markdown("<div class='notice'>候補のボーナスは「残り数字から重み上位」を自動で提案します。購入時のボーナスは運営側が決めるため、ここでは“補助”として扱います。</div>", unsafe_allow_html=True)
 
-        colA, colB, colC = st.columns(3)
-        train_window = colA.number_input("学習窓（直前何回で作る？）", min_value=30, max_value=800, value=200, step=10)
-        test_last = colB.number_input("直近何回を検証？", min_value=10, max_value=300, value=50, step=10)
-        n_c = colC.number_input("各回で生成する候補数", min_value=5, max_value=300, value=min(30, int(n_cands)), step=5)
-
-        seed_val = None
-        if seed_txt.strip():
-            try:
-                seed_val = int(seed_txt.strip())
-            except Exception:
-                seed_val = None
-
-        if st.button("バックテストを実行", type="primary"):
-            with st.spinner("集計中…"):
-                bt = run_backtest(
-                    hist=hist, spec=spec,
-                    train_window=int(train_window), test_last=int(test_last), n_cands=int(n_c),
-                    bias=float(bias), avoid_consec=bool(avoid_consec), avoid_bday=bool(avoid_bday),
-                    max_decade=int(max_dec), gen_bonus=bool(gen_bonus), seed=seed_val
+        # 体感速度対策：押した後は spinner + キャッシュ利用
+        if st.button("候補を生成する"):
+            with st.spinner("候補を生成中…（履歴が多いほど少し時間がかかる場合があります）"):
+                # ほんの少しだけ待機させて“固まった感”を消す（体感改善）
+                time.sleep(0.15)
+                cands = generate_candidates(
+                    hist,
+                    spec,
+                    k_candidates=int(k_candidates),
+                    recent_n=int(recent_n),
+                    bias_hot=float(bias_hot),
+                    avoid_3consec=bool(avoid_3consec),
+                    avoid_single_decade=bool(avoid_single_decade),
                 )
+                st.session_state.generated = cands
 
-            if bt is None or len(bt) == 0:
-                st.warning("バックテスト対象が不足しています。学習窓や検証範囲を調整してください。")
+        cands = st.session_state.get("generated", [])
+        if cands:
+            st.markdown("### 生成結果")
+            rows = []
+            for i, c in enumerate(cands, start=1):
+                rows.append(
+                    {
+                        "No.": i,
+                        "本数字": " ".join(map(str, c["main"])),
+                        "ボーナス提案": " ".join(map(str, c["bonus"])) if c["bonus"] else "",
+                        "理由（簡易）": c["reason"],
+                    }
+                )
+            df = pd.DataFrame(rows)
+            st.dataframe(df, use_container_width=True, hide_index=True)
+
+            # チップ表示（見分けやすく）
+            st.markdown("<div class='hr'></div>", unsafe_allow_html=True)
+            st.markdown("### 見やすい表示（本数字＝黒 / ボーナス＝黄）")
+            show_n = min(10, len(cands))
+            for i in range(show_n):
+                c = cands[i]
+                chips_html = "<div class='chips'>"
+                for n in c["main"]:
+                    chips_html += f"<span class='chip main'>{n}</span>"
+                for b in c["bonus"]:
+                    chips_html += f"<span class='chip bonus'>B{b}</span>"
+                chips_html += "</div>"
+                st.markdown(f"<div class='card'><b>候補 {i+1}</b><br>{chips_html}<div class='mini' style='margin-top:8px;'>{c['reason']}</div></div>", unsafe_allow_html=True)
+
+    st.markdown("</div>", unsafe_allow_html=True)
+
+with tabs[3]:
+    game_name = st.selectbox("ゲーム（バックテスト）", ["ロト6", "ロト7"], index=0, key="game_bt")
+    spec = GAME_MAP[game_name]
+    hist = st.session_state.history[game_name]
+
+    st.markdown("<div class='card'>", unsafe_allow_html=True)
+    st.subheader("バックテスト（簡易）")
+    st.caption("過去N回を順に「直前の履歴だけ」で学習→候補生成→最も当たりに近い候補の一致数を記録します。")
+
+    if len(hist) < 30:
+        st.info("履歴が少ないため、バックテストは十分に動きません。まず履歴を増やしてください。")
+        st.markdown("</div>", unsafe_allow_html=True)
+    else:
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            test_last_n = st.number_input("検証する直近回数（N）", 20, 200, 50, step=10)
+            train_window = st.number_input("学習に使う過去回数", 30, 300, 80, step=10)
+        with col2:
+            candidates_per_round = st.number_input("各回の生成候補数", 10, 200, 30, step=10)
+            recent_n = st.number_input("直近N回（ホット/コールド）", 10, 80, 30, step=5)
+        with col3:
+            bias_hot = st.slider("ホット寄り ↔ コールド寄り", 0.0, 1.0, 0.65, 0.05, key="bt_bias")
+            avoid_3consec = st.checkbox("3連番回避", True, key="bt_c1")
+            avoid_single_decade = st.checkbox("同一10番代回避", True, key="bt_c2")
+
+        if st.button("バックテストを実行"):
+            with st.spinner("バックテスト中…"):
+                dfbt = backtest(
+                    hist,
+                    spec,
+                    test_last_n=int(test_last_n),
+                    train_window=int(train_window),
+                    candidates_per_round=int(candidates_per_round),
+                    recent_n=int(recent_n),
+                    bias_hot=float(bias_hot),
+                    avoid_3consec=bool(avoid_3consec),
+                    avoid_single_decade=bool(avoid_single_decade),
+                )
+            if dfbt.empty:
+                st.warning("バックテスト結果を作れませんでした（履歴不足の可能性）。")
             else:
-                st.success(f"{len(bt)}回分の検証が完了しました。")
-                st.dataframe(bt.tail(50), use_container_width=True, height=320)
+                st.success("完了しました。")
+                st.dataframe(dfbt, use_container_width=True, hide_index=True)
 
                 # 集計
                 st.markdown("<div class='hr'></div>", unsafe_allow_html=True)
-                st.subheader("集計（本数字ヒット最大）")
-                dist = bt["本数字ヒット最大"].value_counts().sort_index()
-                dist_df = dist.rename_axis("ヒット数").reset_index(name="回数")
-                st.dataframe(dist_df, use_container_width=True, height=260)
-                st.bar_chart(dist_df.set_index("ヒット数")["回数"])
+                st.markdown("### 集計（本数字の一致数）")
+                vc = dfbt["best_hit_main"].value_counts().sort_index(ascending=False)
+                st.dataframe(pd.DataFrame({"hit": vc.index, "count": vc.values}), hide_index=True, use_container_width=True)
 
-                if spec.has_bonus and gen_bonus:
-                    st.subheader("ボーナス一致（最大ヒットの候補の中で一致した回数）")
-                    bcnt = int(bt["ボーナス一致"].sum())
-                    st.write(f"ボーナス一致：{bcnt} / {len(bt)} 回")
+                csv = dfbt.to_csv(index=False).encode("utf-8-sig")
+                st.download_button("CSVでダウンロード", data=csv, file_name=f"backtest_{game_name}.csv", mime="text/csv")
 
-        st.caption("注意：バックテスト結果が良くても、将来の当せんを保証するものではありません。")
-        st.markdown("</div>", unsafe_allow_html=True)
+    st.markdown("</div>", unsafe_allow_html=True)
 
-# -----------------------------
-# 設定メモ
-# -----------------------------
 with tabs[4]:
     st.markdown("<div class='card'>", unsafe_allow_html=True)
-    st.subheader("設定メモ（あなた用）")
-    st.markdown("""
-- まずは「生成数：30」「学習窓：200」「検証：50」でバックテストし、重くなるなら数値を下げる  
-- ボーナスは <span class='badge-bonus'>B</span> で表示。候補にも付けたい場合は「ボーナスも生成」をON  
-- 自動取り込みは便利ですが、貼り付け直後に重い場合はOFFにして「手動で履歴に追加」でもOK  
-""", unsafe_allow_html=True)
+    st.subheader("設定メモ（購入者向け案内用）")
+
+    st.session_state.public_url = st.text_input("公開URL（ここに貼る）", value=st.session_state.public_url)
+
+    st.markdown("<div class='hr'></div>", unsafe_allow_html=True)
+    st.markdown("### iPhone（Safari）での使い方（商品説明にコピペ用）")
+    howto = f"""
+1. Safariで下のURLを開きます  
+{st.session_state.public_url}
+
+2. 画面下の「共有」→「ホーム画面に追加」  
+3. ホーム画面のアイコンから開くと、アプリ風に使えます
+
+ボーナス数字の入れ方  
+・ロト6：本数字6個のあとに「B ボーナス」を1つ  
+例：第2067回 3,4,12,15,32,33 B34  
+・ロト7：本数字7個のあとに「B ボーナス」を最大2つ  
+例：第600回 1,5,7,12,18,21,33 B2 35
+"""
+    st.code(howto, language="text")
+
     st.markdown("</div>", unsafe_allow_html=True)
+
+
+# フッター
+st.caption("© ロト6・ロト7分析ツール（個人利用向け）")
